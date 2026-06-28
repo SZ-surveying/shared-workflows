@@ -205,9 +205,21 @@ jobs:
             dockerfile="$(echo "${image}" | jq -r '.file // "Dockerfile"')"
             build_args="$(echo "${image}" | jq -r '.buildArgs // ""')"
             portal_client="$(echo "${image}" | jq -r '.portalClient // false')"
+            title="$(echo "${image}" | jq -r '.title // .name // .key')"
+            description="$(echo "${image}" | jq -r '.description // ""')"
+            source="$(echo "${image}" | jq -r '.source // ""')"
+            url="$(echo "${image}" | jq -r '.url // ""')"
+            documentation="$(echo "${image}" | jq -r '.documentation // ""')"
+            licenses="$(echo "${image}" | jq -r '.licenses // ""')"
 
             if [[ -z "${repository}" ]]; then
               repository="${REGISTRY}/${namespace}/${name}"
+            fi
+            if [[ -z "${source}" ]]; then
+              source="https://github.com/${GITHUB_REPOSITORY}"
+            fi
+            if [[ -z "${url}" ]]; then
+              url="${source}"
             fi
 
             if [[ "${dockerfile}" != /* && ! -f "${dockerfile}" && -f "${context%/}/${dockerfile}" ]]; then
@@ -227,7 +239,23 @@ jobs:
               --tag "${repository}:sha-${GITHUB_SHA}"
               --build-arg "APP_VERSION=${VERSION}"
               --build-arg "GIT_COMMIT=${GITHUB_SHA}"
+              --label "org.opencontainers.image.title=${title}"
+              --label "org.opencontainers.image.source=${source}"
+              --label "org.opencontainers.image.url=${url}"
+              --label "org.opencontainers.image.version=${VERSION}"
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}"
+              --label "org.opencontainers.image.ref.name=${GITHUB_REF_NAME}"
+              --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             )
+            if [[ -n "${description}" ]]; then
+              build_cmd+=(--label "org.opencontainers.image.description=${description}")
+            fi
+            if [[ -n "${documentation}" ]]; then
+              build_cmd+=(--label "org.opencontainers.image.documentation=${documentation}")
+            fi
+            if [[ -n "${licenses}" ]]; then
+              build_cmd+=(--label "org.opencontainers.image.licenses=${licenses}")
+            fi
 
             if [[ "${portal_client}" == "true" ]]; then
               test -n "${PORTAL_CLIENT_VERSION}" || {

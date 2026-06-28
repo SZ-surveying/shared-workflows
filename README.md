@@ -28,6 +28,9 @@ jobs:
           {
             "key": "backend",
             "name": "surveying-backend",
+            "title": "Surveying Backend API",
+            "description": "Go HTTP API service for the surveying platform.",
+            "documentation": "https://github.com/SZ-surveying/surveying-backend/blob/main/docs/images.md#surveying-backend",
             "context": ".",
             "file": "services/backend/Dockerfile"
           }
@@ -47,8 +50,18 @@ Image fields:
 | `file`         | No       | Dockerfile path, default `Dockerfile`.          |
 | `buildArgs`    | No       | Multiline Docker build args.                    |
 | `portalClient` | No       | Resolve latest portal client and add secrets.   |
+| `title`        | No       | OCI image title; defaults to image name/key.    |
+| `description`  | No       | OCI image description.                          |
+| `source`       | No       | OCI image source URL; defaults to repository.   |
+| `url`          | No       | OCI image URL; defaults to source.              |
+| `documentation` | No      | OCI image documentation URL.                    |
+| `licenses`     | No       | OCI image license expression.                   |
 
 `name` is required unless `repository` is provided.
+
+The workflow writes standard OCI labels for every image, including title,
+source, URL, version, revision, ref name, and creation time. Optional image
+fields add description, documentation, and license labels.
 
 Optional secrets:
 
