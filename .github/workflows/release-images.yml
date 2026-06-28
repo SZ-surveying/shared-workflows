@@ -183,6 +183,19 @@ jobs:
           namespace="${GHCR_NAMESPACE:-${GITHUB_REPOSITORY_OWNER}}"
           namespace="$(echo "${namespace}" | tr '[:upper:]' '[:lower:]')"
           echo '{}' > .shared-release/images.json
+          echo "${IMAGES}" | jq -c '.[]' > .shared-release/image-definitions.jsonl
+
+          while IFS= read -r image; do
+            name="$(echo "${image}" | jq -r '.name // ""')"
+            repository="$(echo "${image}" | jq -r '.repository // ""')"
+            if [[ -z "${repository}" ]]; then
+              repository="${REGISTRY}/${namespace}/${name}"
+            fi
+            if docker manifest inspect "${repository}:${VERSION}" >/dev/null 2>&1; then
+              echo "Image tag already exists: ${repository}:${VERSION}" >&2
+              exit 1
+            fi
+          done < .shared-release/image-definitions.jsonl
 
           while IFS= read -r image; do
             key="$(echo "${image}" | jq -r '.key')"
@@ -197,8 +210,11 @@ jobs:
               repository="${REGISTRY}/${namespace}/${name}"
             fi
 
-            if docker manifest inspect "${repository}:${VERSION}" >/dev/null 2>&1; then
-              echo "Image tag already exists: ${repository}:${VERSION}" >&2
+            if [[ "${dockerfile}" != /* && ! -f "${dockerfile}" && -f "${context%/}/${dockerfile}" ]]; then
+              dockerfile="${context%/}/${dockerfile}"
+            fi
+            if [[ ! -f "${dockerfile}" ]]; then
+              echo "Dockerfile not found for ${key}: ${dockerfile}" >&2
               exit 1
             fi
 
@@ -239,7 +255,7 @@ jobs:
               '. + {($key): {repository: $repository, tag: $tag, digest: $digest}}' \
               .shared-release/images.json > "${tmp}"
             mv "${tmp}" .shared-release/images.json
-          done < <(echo "${IMAGES}" | jq -c '.[]')
+          done < .shared-release/image-definitions.jsonl
 
           echo "images=$(jq -c . .shared-release/images.json)" >> "$GITHUB_OUTPUT"
 
