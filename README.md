@@ -4,6 +4,89 @@ A collection of reusable GitHub Actions workflows and actions designed to simpli
 
 ## 📦 Contents
 
+### Workflows
+
+#### 1. Release Images
+
+Path: `.github/workflows/release-images.yml`
+
+Builds one or more Docker images from a release tag, pushes version and
+`sha-<commit>` tags to GHCR, resolves immutable digests, and optionally sends a
+`component_image_release` dispatch payload to the integration repository.
+
+Caller example:
+
+```yaml
+jobs:
+  release-images:
+    uses: SZ-surveying/shared-workflows/.github/workflows/release-images.yml@main
+    with:
+      component: backend
+      project-repository: ${{ vars.PROJECT_REPOSITORY }}
+      images: |
+        [
+          {
+            "key": "backend",
+            "name": "surveying-backend",
+            "context": ".",
+            "file": "services/backend/Dockerfile"
+          }
+        ]
+    secrets:
+      project_dispatch_token: ${{ secrets.PROJECT_DISPATCH_TOKEN }}
+```
+
+Image fields:
+
+| Field          | Required | Description                                      |
+| -------------- | -------- | ------------------------------------------------ |
+| `key`          | Yes      | Payload key, for example `backend` or `portal`. |
+| `name`         | Yes*     | Image name under GHCR namespace.                |
+| `repository`   | No       | Full image repository; overrides `name`.        |
+| `context`      | No       | Docker build context, default `.`.              |
+| `file`         | No       | Dockerfile path, default `Dockerfile`.          |
+| `buildArgs`    | No       | Multiline Docker build args.                    |
+| `portalClient` | No       | Resolve latest portal client and add secrets.   |
+
+`name` is required unless `repository` is provided.
+
+Optional secrets:
+
+- `project_dispatch_token`: sends release candidate dispatch.
+- `npm_token`: required when an image uses `portalClient: true`.
+- `portal_vite_env`: optional Vite env block for portal builds.
+
+#### 2. Release Helm Chart
+
+Path: `.github/workflows/release-helm.yml`
+
+Packages a Helm chart from a `release-helm/<semver>` tag, merges the existing
+Helm repo `index.yaml`, publishes to `gh-pages` with historical files retained,
+and optionally sends a `component_chart_release` dispatch payload.
+
+Caller example:
+
+```yaml
+jobs:
+  release-chart:
+    uses: SZ-surveying/shared-workflows/.github/workflows/release-helm.yml@main
+    with:
+      component: backend
+      chart-dir: charts/surveying-backend
+      repo-url: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+      project-repository: ${{ vars.PROJECT_REPOSITORY }}
+      app-version-images: |
+        [
+          "surveying-backend",
+          "surveying-python-service"
+        ]
+    secrets:
+      project_dispatch_token: ${{ secrets.PROJECT_DISPATCH_TOKEN }}
+```
+
+The workflow validates tag format, version monotonicity, `Chart.yaml` version,
+`Chart.yaml` appVersion, and that the tag commit is already on `origin/main`.
+
 ### Actions
 
 #### 1. Extract Tag Version

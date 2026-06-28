@@ -1,0 +1,304 @@
+name: Release Images
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: "Component name used in repository_dispatch payload."
+        type: string
+        required: true
+      images:
+        description: "JSON array of image definitions."
+        type: string
+        required: true
+      main-branch:
+        description: "Branch that release tag commits must already be on."
+        type: string
+        required: false
+        default: "main"
+      tag-prefix:
+        description: "Prefix stripped from the Git tag to get the image version."
+        type: string
+        required: false
+        default: "v"
+      registry:
+        description: "Container registry host."
+        type: string
+        required: false
+        default: "ghcr.io"
+      ghcr-namespace:
+        description: "Image namespace. Defaults to repository owner lowercased."
+        type: string
+        required: false
+        default: ""
+      project-repository:
+        description: "Repository that receives component_image_release dispatch."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      project_dispatch_token:
+        required: false
+      npm_token:
+        required: false
+      portal_vite_env:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release-images:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      images: ${{ steps.build.outputs.images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse and validate version
+        id: version
+        shell: bash
+        env:
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          tag="${GITHUB_REF_NAME}"
+          if [[ "${tag}" != "${TAG_PREFIX}"* ]]; then
+            echo "Release tag ${tag} must start with ${TAG_PREFIX}" >&2
+            exit 1
+          fi
+          version="${tag#"$TAG_PREFIX"}"
+          if [[ ! "${version}" =~ ${semver_re} ]]; then
+            echo "Release version must be semver without prefix; got ${version}" >&2
+            exit 1
+          fi
+          max_version="$(
+            git tag -l "${TAG_PREFIX}*" \
+              | while read -r existing_tag; do
+                  existing_version="${existing_tag#"$TAG_PREFIX"}"
+                  if [[ "${existing_version}" =~ ${semver_re} ]]; then
+                    printf '%s\n' "${existing_version}"
+                  fi
+                done \
+              | sort -V \
+              | tail -n 1
+          )"
+          if [[ -n "${max_version}" && "${max_version}" != "${version}" ]]; then
+            echo "Release version ${version} is not monotonic; max tag is ${max_version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "git_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag commit is on main
+        shell: bash
+        env:
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${MAIN_BRANCH}"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${MAIN_BRANCH}"; then
+            echo "Release tag ${GITHUB_REF_NAME} must point to a commit on origin/${MAIN_BRANCH}." >&2
+            exit 1
+          fi
+
+      - name: Validate image definitions
+        shell: bash
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          set -euo pipefail
+          echo "${IMAGES}" | jq -e '
+            type == "array" and length > 0 and
+            all(.[]; (.key | type == "string" and length > 0) and
+                    ((.name // .repository) | type == "string" and length > 0))
+          ' >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve portal client version
+        id: portal_client
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.npm_token }}
+          IMAGES: ${{ inputs.images }}
+        run: |
+          set -euo pipefail
+          if ! echo "${IMAGES}" | jq -e 'any(.[]; .portalClient == true)' >/dev/null; then
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test -n "${GH_TOKEN}" || {
+            echo "npm-token is required when an image sets portalClient=true." >&2
+            exit 1
+          }
+          version="$(
+            gh api --paginate '/orgs/SZ-surveying/packages/npm/%40SZ-surveying%2Fportal-client/versions' --jq '.[].name' \
+              | sed -nE 's/^((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$/\1/p' \
+              | sort -V \
+              | tail -n 1
+          )"
+          if [[ -z "${version}" ]]; then
+            echo "Unable to resolve latest @SZ-surveying/portal-client version from GitHub Packages." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare BuildKit secrets
+        shell: bash
+        env:
+          PORTAL_VITE_ENV: ${{ secrets.portal_vite_env }}
+          NPM_TOKEN: ${{ secrets.npm_token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .shared-release
+          printf '%s\n' "${PORTAL_VITE_ENV:-}" > .shared-release/vite.env
+          printf '%s' "${NPM_TOKEN:-}" > .shared-release/npm-token
+
+      - name: Build and push images
+        id: build
+        shell: bash
+        env:
+          IMAGES: ${{ inputs.images }}
+          REGISTRY: ${{ inputs.registry }}
+          GHCR_NAMESPACE: ${{ inputs.ghcr-namespace }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PORTAL_CLIENT_VERSION: ${{ steps.portal_client.outputs.version }}
+        run: |
+          set -euo pipefail
+          namespace="${GHCR_NAMESPACE:-${GITHUB_REPOSITORY_OWNER}}"
+          namespace="$(echo "${namespace}" | tr '[:upper:]' '[:lower:]')"
+          echo '{}' > .shared-release/images.json
+
+          while IFS= read -r image; do
+            key="$(echo "${image}" | jq -r '.key')"
+            name="$(echo "${image}" | jq -r '.name // ""')"
+            repository="$(echo "${image}" | jq -r '.repository // ""')"
+            context="$(echo "${image}" | jq -r '.context // "."')"
+            dockerfile="$(echo "${image}" | jq -r '.file // "Dockerfile"')"
+            build_args="$(echo "${image}" | jq -r '.buildArgs // ""')"
+            portal_client="$(echo "${image}" | jq -r '.portalClient // false')"
+
+            if [[ -z "${repository}" ]]; then
+              repository="${REGISTRY}/${namespace}/${name}"
+            fi
+
+            if docker manifest inspect "${repository}:${VERSION}" >/dev/null 2>&1; then
+              echo "Image tag already exists: ${repository}:${VERSION}" >&2
+              exit 1
+            fi
+
+            build_cmd=(
+              docker buildx build
+              "${context}"
+              --file "${dockerfile}"
+              --push
+              --tag "${repository}:${VERSION}"
+              --tag "${repository}:sha-${GITHUB_SHA}"
+              --build-arg "APP_VERSION=${VERSION}"
+              --build-arg "GIT_COMMIT=${GITHUB_SHA}"
+            )
+
+            if [[ "${portal_client}" == "true" ]]; then
+              test -n "${PORTAL_CLIENT_VERSION}" || {
+                echo "portal client version was not resolved." >&2
+                exit 1
+              }
+              build_cmd+=(--build-arg "CLIENT_VERSION=${PORTAL_CLIENT_VERSION}")
+              build_cmd+=(--secret "id=vite_env,src=.shared-release/vite.env")
+              build_cmd+=(--secret "id=npm_token,src=.shared-release/npm-token")
+            fi
+
+            while IFS= read -r arg; do
+              [[ -n "${arg}" ]] || continue
+              build_cmd+=(--build-arg "${arg}")
+            done <<< "${build_args}"
+
+            "${build_cmd[@]}"
+            digest="$(docker buildx imagetools inspect "${repository}:${VERSION}" --format '{{.Manifest.Digest}}')"
+            tmp="$(mktemp)"
+            jq \
+              --arg key "${key}" \
+              --arg repository "${repository}" \
+              --arg tag "${VERSION}" \
+              --arg digest "${digest}" \
+              '. + {($key): {repository: $repository, tag: $tag, digest: $digest}}' \
+              .shared-release/images.json > "${tmp}"
+            mv "${tmp}" .shared-release/images.json
+          done < <(echo "${IMAGES}" | jq -c '.[]')
+
+          echo "images=$(jq -c . .shared-release/images.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch project candidate
+        shell: bash
+        env:
+          PROJECT_REPOSITORY: ${{ inputs.project-repository }}
+          PROJECT_DISPATCH_TOKEN: ${{ secrets.project_dispatch_token }}
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ steps.version.outputs.version }}
+          GIT_TAG: ${{ steps.version.outputs.git_tag }}
+          IMAGES_JSON: ${{ steps.build.outputs.images }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PROJECT_REPOSITORY}" || -z "${PROJECT_DISPATCH_TOKEN}" ]]; then
+            echo "::notice::project-repository or project-dispatch-token is empty; skipping project dispatch"
+            exit 0
+          fi
+          payload="$(mktemp)"
+          jq -n \
+            --arg component "${COMPONENT}" \
+            --arg version "${VERSION}" \
+            --arg git_tag "${GIT_TAG}" \
+            --arg git_sha "${GITHUB_SHA}" \
+            --arg git_ref "${GITHUB_REF}" \
+            --argjson images "${IMAGES_JSON}" \
+            '{
+              event_type: "component_image_release",
+              client_payload: {
+                component: $component,
+                releaseKind: "image",
+                version: $version,
+                gitTag: $git_tag,
+                gitSha: $git_sha,
+                gitRef: $git_ref,
+                images: $images
+              }
+            }' > "${payload}"
+          curl -fsS \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PROJECT_DISPATCH_TOKEN}" \
+            "https://api.github.com/repos/${PROJECT_REPOSITORY}/dispatches" \
+            -d @"${payload}"
+
+      - name: Publish summary
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGES_JSON: ${{ steps.build.outputs.images }}
+          PORTAL_CLIENT_VERSION: ${{ steps.portal_client.outputs.version }}
+        run: |
+          {
+            echo "## Image release"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            if [[ -n "${PORTAL_CLIENT_VERSION}" ]]; then
+              echo "- Portal client: \`${PORTAL_CLIENT_VERSION}\`"
+            fi
+            echo
+            echo "${IMAGES_JSON}" | jq -r 'to_entries[] | "- \(.key): `\(.value.repository)@\(.value.digest)`"'
+          } >> "$GITHUB_STEP_SUMMARY"

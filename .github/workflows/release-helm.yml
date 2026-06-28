@@ -1,0 +1,283 @@
+name: Release Helm Chart
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: "Component name used in repository_dispatch payload."
+        type: string
+        required: true
+      chart-dir:
+        description: "Chart directory."
+        type: string
+        required: false
+        default: "helm"
+      repo-url:
+        description: "Published Helm repository URL."
+        type: string
+        required: true
+      main-branch:
+        description: "Branch that release tag commits must already be on."
+        type: string
+        required: false
+        default: "main"
+      tag-prefix:
+        description: "Prefix stripped from the Git tag to get the chart version."
+        type: string
+        required: false
+        default: "release-helm/"
+      registry:
+        description: "Container registry host for appVersion image checks."
+        type: string
+        required: false
+        default: "ghcr.io"
+      ghcr-namespace:
+        description: "Image namespace. Defaults to repository owner lowercased."
+        type: string
+        required: false
+        default: ""
+      app-version-images:
+        description: "JSON array of image names that must exist at Chart.appVersion."
+        type: string
+        required: false
+        default: "[]"
+      project-repository:
+        description: "Repository that receives component_chart_release dispatch."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      project_dispatch_token:
+        required: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  release-chart:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      chart_name: ${{ steps.version.outputs.chart_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse and validate chart version
+        id: version
+        shell: bash
+        env:
+          CHART_DIR: ${{ inputs.chart-dir }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          tag="${GITHUB_REF_NAME}"
+          if [[ "${tag}" != "${TAG_PREFIX}"* ]]; then
+            echo "Helm release tag ${tag} must start with ${TAG_PREFIX}" >&2
+            exit 1
+          fi
+          version="${tag#"$TAG_PREFIX"}"
+          if [[ ! "${version}" =~ ${semver_re} ]]; then
+            echo "Chart release version must be semver; got ${version}" >&2
+            exit 1
+          fi
+          max_version="$(
+            git tag -l "${TAG_PREFIX}*" \
+              | while read -r existing_tag; do
+                  existing_version="${existing_tag#"$TAG_PREFIX"}"
+                  if [[ "${existing_version}" =~ ${semver_re} ]]; then
+                    printf '%s\n' "${existing_version}"
+                  fi
+                done \
+              | sort -V \
+              | tail -n 1
+          )"
+          if [[ -n "${max_version}" && "${max_version}" != "${version}" ]]; then
+            echo "Chart release version ${version} is not monotonic; max tag is ${max_version}" >&2
+            exit 1
+          fi
+
+          chart_name="$(sed -nE 's/^name:[[:space:]]*"?([^"]+)"?/\1/p' "${CHART_DIR}/Chart.yaml")"
+          chart_version="$(sed -nE 's/^version:[[:space:]]*"?([^"]+)"?/\1/p' "${CHART_DIR}/Chart.yaml")"
+          app_version="$(sed -nE 's/^appVersion:[[:space:]]*"?([^"]+)"?/\1/p' "${CHART_DIR}/Chart.yaml")"
+          if [[ -z "${chart_name}" ]]; then
+            echo "Chart.yaml name is required." >&2
+            exit 1
+          fi
+          if [[ "${chart_version}" != "${version}" ]]; then
+            echo "Chart.yaml version ${chart_version} does not match tag ${version}" >&2
+            exit 1
+          fi
+          if [[ ! "${app_version}" =~ ${semver_re} ]]; then
+            echo "Chart.yaml appVersion must be semver without v; got ${app_version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${app_version}" >> "$GITHUB_OUTPUT"
+          echo "chart_name=${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "git_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag commit is on main
+        shell: bash
+        env:
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${MAIN_BRANCH}"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${MAIN_BRANCH}"; then
+            echo "Release tag ${GITHUB_REF_NAME} must point to a commit on origin/${MAIN_BRANCH}." >&2
+            exit 1
+          fi
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR
+        if: inputs.app-version-images != '[]'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check appVersion images exist
+        if: inputs.app-version-images != '[]'
+        shell: bash
+        env:
+          IMAGES: ${{ inputs.app-version-images }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          REGISTRY: ${{ inputs.registry }}
+          GHCR_NAMESPACE: ${{ inputs.ghcr-namespace }}
+        run: |
+          set -euo pipefail
+          namespace="${GHCR_NAMESPACE:-${GITHUB_REPOSITORY_OWNER}}"
+          namespace="$(echo "${namespace}" | tr '[:upper:]' '[:lower:]')"
+          echo "${IMAGES}" | jq -e 'type == "array"' >/dev/null
+          while IFS= read -r name; do
+            image="${REGISTRY}/${namespace}/${name}:${APP_VERSION}"
+            docker manifest inspect "${image}" >/dev/null
+          done < <(echo "${IMAGES}" | jq -r '.[]')
+
+      - name: Lint chart
+        run: helm lint "${{ inputs.chart-dir }}"
+
+      - name: Render chart
+        run: helm template release-check "${{ inputs.chart-dir }}" >/tmp/release-chart.yaml
+
+      - name: Build chart repository update
+        shell: bash
+        env:
+          CHART_DIR: ${{ inputs.chart-dir }}
+          REPO_URL: ${{ inputs.repo-url }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CHART_NAME: ${{ steps.version.outputs.chart_name }}
+        run: |
+          set -euo pipefail
+          repo_url="${REPO_URL%/}"
+          package="${CHART_NAME}-${VERSION}.tgz"
+          mkdir -p .chart-release
+
+          helm dependency update "${CHART_DIR}"
+          helm package "${CHART_DIR}" --destination .chart-release
+
+          if curl -fsSL -o .chart-release/index.yaml "${repo_url}/index.yaml"; then
+            if grep -q "${package}" .chart-release/index.yaml; then
+              echo "Chart package already exists in index.yaml: ${package}" >&2
+              exit 1
+            fi
+            (
+              cd .chart-release
+              helm repo index . --url "${repo_url}" --merge index.yaml
+            )
+          else
+            echo "No existing Helm index.yaml found; creating a new index."
+            (
+              cd .chart-release
+              helm repo index . --url "${repo_url}"
+            )
+          fi
+
+      - name: Publish chart to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .chart-release
+          publish_branch: gh-pages
+          keep_files: true
+
+      - name: Dispatch project candidate
+        shell: bash
+        env:
+          PROJECT_REPOSITORY: ${{ inputs.project-repository }}
+          PROJECT_DISPATCH_TOKEN: ${{ secrets.project_dispatch_token }}
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          GIT_TAG: ${{ steps.version.outputs.git_tag }}
+          CHART_NAME: ${{ steps.version.outputs.chart_name }}
+          REPO_URL: ${{ inputs.repo-url }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PROJECT_REPOSITORY}" || -z "${PROJECT_DISPATCH_TOKEN}" ]]; then
+            echo "::notice::project-repository or project-dispatch-token is empty; skipping project dispatch"
+            exit 0
+          fi
+          repo_url="${REPO_URL%/}"
+          payload="$(mktemp)"
+          jq -n \
+            --arg component "${COMPONENT}" \
+            --arg version "${VERSION}" \
+            --arg git_tag "${GIT_TAG}" \
+            --arg app_version "${APP_VERSION}" \
+            --arg git_sha "${GITHUB_SHA}" \
+            --arg git_ref "${GITHUB_REF}" \
+            --arg chart_name "${CHART_NAME}" \
+            --arg repository "${repo_url}" \
+            --arg package "${CHART_NAME}-${VERSION}.tgz" \
+            '{
+              event_type: "component_chart_release",
+              client_payload: {
+                component: $component,
+                releaseKind: "helm-chart",
+                version: $version,
+                gitTag: $git_tag,
+                appVersion: $app_version,
+                gitSha: $git_sha,
+                gitRef: $git_ref,
+                chart: {
+                  name: $chart_name,
+                  version: $version,
+                  appVersion: $app_version,
+                  repository: $repository,
+                  package: $package
+                }
+              }
+            }' > "${payload}"
+          curl -fsS \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PROJECT_DISPATCH_TOKEN}" \
+            "https://api.github.com/repos/${PROJECT_REPOSITORY}/dispatches" \
+            -d @"${payload}"
+
+      - name: Publish summary
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          CHART_NAME: ${{ steps.version.outputs.chart_name }}
+          REPO_URL: ${{ inputs.repo-url }}
+        run: |
+          {
+            echo "## Helm chart release"
+            echo
+            echo "- Chart: \`${CHART_NAME}\`"
+            echo "- Version: \`${VERSION}\`"
+            echo "- App version: \`${APP_VERSION}\`"
+            echo "- Repository: \`${REPO_URL%/}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
