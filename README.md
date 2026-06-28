@@ -50,6 +50,8 @@ Image fields:
 | `file`         | No       | Dockerfile path, default `Dockerfile`.          |
 | `buildArgs`    | No       | Multiline Docker build args.                    |
 | `portalClient` | No       | Resolve latest portal client and add secrets.   |
+| `portalClientPackage` | No | Full npm package installed in portal builds.    |
+| `portalClientApiPackage` | No | GitHub Packages resource name; defaults to the unscoped package name. |
 | `title`        | No       | OCI image title; defaults to image name/key.    |
 | `description`  | No       | OCI image description.                          |
 | `source`       | No       | OCI image source URL; defaults to repository.   |
@@ -66,7 +68,8 @@ fields add description, documentation, and license labels.
 Optional secrets:
 
 - `project_dispatch_token`: sends release candidate dispatch.
-- `npm_token`: required when an image uses `portalClient: true`.
+- `npm_token`: required when an image uses `portalClient: true`; the token needs
+  `read:packages`.
 - `portal_vite_env`: optional Vite env block for portal builds.
 
 #### 2. Release Helm Chart

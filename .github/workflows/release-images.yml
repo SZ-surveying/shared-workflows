@@ -138,25 +138,52 @@ jobs:
           IMAGES: ${{ inputs.images }}
         run: |
           set -euo pipefail
-          if ! echo "${IMAGES}" | jq -e 'any(.[]; .portalClient == true)' >/dev/null; then
+          portal_images="$(echo "${IMAGES}" | jq -c '[.[] | select(.portalClient == true)]')"
+          if [[ "$(echo "${portal_images}" | jq 'length')" -eq 0 ]]; then
             echo "version=" >> "$GITHUB_OUTPUT"
+            echo "package=" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          package="$(
+            echo "${portal_images}" \
+              | jq -r 'map(.portalClientPackage // "@SZ-surveying/portal-client") | unique | .[]'
+          )"
+          api_package="$(
+            echo "${portal_images}" \
+              | jq -r 'map(.portalClientApiPackage // ((.portalClientPackage // "@SZ-surveying/portal-client") | split("/") | last)) | unique | .[]'
+          )"
+          if [[ "$(printf '%s\n' "${package}" | sed '/^$/d' | wc -l)" -ne 1 ]]; then
+            echo "All portalClient images in one release must use the same portalClientPackage." >&2
+            printf '%s\n' "${package}" >&2
+            exit 1
+          fi
+          if [[ "$(printf '%s\n' "${api_package}" | sed '/^$/d' | wc -l)" -ne 1 ]]; then
+            echo "All portalClient images in one release must use the same portalClientApiPackage." >&2
+            printf '%s\n' "${api_package}" >&2
+            exit 1
           fi
           test -n "${GH_TOKEN}" || {
             echo "npm-token is required when an image sets portalClient=true." >&2
             exit 1
           }
-          version="$(
-            gh api --paginate '/orgs/SZ-surveying/packages/npm/%40SZ-surveying%2Fportal-client/versions' --jq '.[].name' \
+          package_path="$(printf '%s' "${api_package}" | jq -sRr @uri)"
+          if ! version="$(
+            gh api --paginate "/orgs/SZ-surveying/packages/npm/${package_path}/versions" --jq '.[].name' \
               | sed -nE 's/^((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$/\1/p' \
               | sort -V \
               | tail -n 1
-          )"
+          )"; then
+            echo "Unable to query GitHub Packages package ${api_package}." >&2
+            echo "Check that npm-token has read:packages and can read ${package}." >&2
+            exit 1
+          fi
           if [[ -z "${version}" ]]; then
-            echo "Unable to resolve latest @SZ-surveying/portal-client version from GitHub Packages." >&2
+            echo "Unable to resolve latest ${package} version from GitHub Packages package ${api_package}." >&2
+            echo "Check that npm-token has read:packages and can read the package." >&2
             exit 1
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "package=${package}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare BuildKit secrets
         shell: bash
@@ -178,6 +205,7 @@ jobs:
           GHCR_NAMESPACE: ${{ inputs.ghcr-namespace }}
           VERSION: ${{ steps.version.outputs.version }}
           PORTAL_CLIENT_VERSION: ${{ steps.portal_client.outputs.version }}
+          PORTAL_CLIENT_PACKAGE: ${{ steps.portal_client.outputs.package }}
         run: |
           set -euo pipefail
           namespace="${GHCR_NAMESPACE:-${GITHUB_REPOSITORY_OWNER}}"
@@ -262,6 +290,11 @@ jobs:
                 echo "portal client version was not resolved." >&2
                 exit 1
               }
+              test -n "${PORTAL_CLIENT_PACKAGE}" || {
+                echo "portal client package was not resolved." >&2
+                exit 1
+              }
+              build_cmd+=(--build-arg "CLIENT_PACKAGE=${PORTAL_CLIENT_PACKAGE}")
               build_cmd+=(--build-arg "CLIENT_VERSION=${PORTAL_CLIENT_VERSION}")
               build_cmd+=(--secret "id=vite_env,src=.shared-release/vite.env")
               build_cmd+=(--secret "id=npm_token,src=.shared-release/npm-token")
@@ -335,13 +368,14 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           IMAGES_JSON: ${{ steps.build.outputs.images }}
           PORTAL_CLIENT_VERSION: ${{ steps.portal_client.outputs.version }}
+          PORTAL_CLIENT_PACKAGE: ${{ steps.portal_client.outputs.package }}
         run: |
           {
             echo "## Image release"
             echo
             echo "- Version: \`${VERSION}\`"
             if [[ -n "${PORTAL_CLIENT_VERSION}" ]]; then
-              echo "- Portal client: \`${PORTAL_CLIENT_VERSION}\`"
+              echo "- Portal client: \`${PORTAL_CLIENT_PACKAGE}@${PORTAL_CLIENT_VERSION}\`"
             fi
             echo
             echo "${IMAGES_JSON}" | jq -r 'to_entries[] | "- \(.key): `\(.value.repository)@\(.value.digest)`"'
