@@ -13,7 +13,7 @@ on:
         required: false
         default: "helm"
       repo-url:
-        description: "Published Helm repository URL."
+        description: "Published Helm OCI repository URL."
         type: string
         required: true
       main-branch:
@@ -51,8 +51,8 @@ on:
         required: false
 
 permissions:
-  contents: write
-  packages: read
+  contents: read
+  packages: write
 
 jobs:
   release-chart:
@@ -169,7 +169,23 @@ jobs:
       - name: Render chart
         run: helm template release-check "${{ inputs.chart-dir }}" >/tmp/release-chart.yaml
 
-      - name: Build chart repository update
+      - name: Login to Helm OCI registry
+        shell: bash
+        env:
+          REPO_URL: ${{ inputs.repo-url }}
+        run: |
+          set -euo pipefail
+          if [[ "${REPO_URL}" != oci://* ]]; then
+            echo "repo-url must be a Helm OCI repository, got: ${REPO_URL}" >&2
+            exit 1
+          fi
+          registry="${REPO_URL#oci://}"
+          registry="${registry%%/*}"
+          helm registry login "${registry}" \
+            --username "${GITHUB_ACTOR}" \
+            --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Package and publish chart
         shell: bash
         env:
           CHART_DIR: ${{ inputs.chart-dir }}
@@ -185,30 +201,16 @@ jobs:
           helm dependency update "${CHART_DIR}"
           helm package "${CHART_DIR}" --destination .chart-release
 
-          if curl -fsSL -o .chart-release/index.yaml "${repo_url}/index.yaml"; then
-            if grep -q "${package}" .chart-release/index.yaml; then
-              echo "Chart package already exists in index.yaml: ${package}" >&2
-              exit 1
-            fi
-            (
-              cd .chart-release
-              helm repo index . --url "${repo_url}" --merge index.yaml
-            )
-          else
-            echo "No existing Helm index.yaml found; creating a new index."
-            (
-              cd .chart-release
-              helm repo index . --url "${repo_url}"
-            )
+          if [[ "${repo_url}" != oci://* ]]; then
+            echo "repo-url must be a Helm OCI repository, got: ${repo_url}" >&2
+            exit 1
+          fi
+          if helm show chart "${repo_url}/${CHART_NAME}" --version "${VERSION}" >/dev/null 2>&1; then
+            echo "Chart package already exists: ${repo_url}/${CHART_NAME}:${VERSION}" >&2
+            exit 1
           fi
 
-      - name: Publish chart to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: .chart-release
-          publish_branch: gh-pages
-          keep_files: true
+          helm push ".chart-release/${package}" "${repo_url}"
 
       - name: Dispatch project candidate
         shell: bash
@@ -228,6 +230,7 @@ jobs:
             exit 0
           fi
           repo_url="${REPO_URL%/}"
+          package_ref="${repo_url#oci://}/${CHART_NAME}:${VERSION}"
           payload="$(mktemp)"
           jq -n \
             --arg component "${COMPONENT}" \
@@ -238,7 +241,7 @@ jobs:
             --arg git_ref "${GITHUB_REF}" \
             --arg chart_name "${CHART_NAME}" \
             --arg repository "${repo_url}" \
-            --arg package "${CHART_NAME}-${VERSION}.tgz" \
+            --arg package "${package_ref}" \
             '{
               event_type: "component_chart_release",
               client_payload: {
